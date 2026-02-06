@@ -188,7 +188,7 @@ def generate_input_file(fasta_path: Path, input_path: Path, logfile_path: Path) 
         tolerance=1,
         frequency_threshold=25,
         strict=True,
-        timelimit=300,
+        timelimit=0,
         organism="ecoli2",
         sequence=sequence,
         logfile=logfile_path,
