@@ -1,3 +1,5 @@
 *.o
 *.mod
 dnaworks
+__pycache__
+*.pyc
