@@ -1,8 +1,9 @@
 from pathlib import Path
-from typing import Literal, Optional, List, Tuple
+from typing import Literal, Optional, List, Tuple, Dict
 from dataclasses import dataclass, field
 import subprocess
 import re
+import math
 from collections import Counter
 from itertools import product
 from scipy.stats import entropy
@@ -13,7 +14,8 @@ Tolerance = Literal[1,2,3,4,5]
 Timelimit = Literal[0,1,30,60,120,180,300]
 Seqtype = Literal["protein", "nucleotide"]
 Threshold = Literal[0,5,10,15,20,25,30]
-Organism = Literal["ecoli2", "E.coli", "C.elegans","D.melanogaster","H.sapiens","M.musculus"]
+Organism = Literal["ecoli2", "ecoli", "c_elegans","d_melanogaster","h_sapiens","m_musculus",
+                    "r_norvegicus","s_cerevisiae","x_laevis","p_pastoris"]
 
 Enzyme = Literal["AflII", "BamHI", "EcoRI", "NcoI","NdeI","HindIII"]
 re_dict = {"AflII": "CCTAGG",
@@ -24,27 +26,77 @@ re_dict = {"AflII": "CCTAGG",
            "HindIII": "AAGCTT"  
            }
 
-CODON_TABLE = {
-    'TTT': 'F', 'TTC': 'F', 'TTA': 'L', 'TTG': 'L',
-    'TCT': 'S', 'TCC': 'S', 'TCA': 'S', 'TCG': 'S',
-    'TAT': 'Y', 'TAC': 'Y', 'TAA': '*', 'TAG': '*',
-    'TGT': 'C', 'TGC': 'C', 'TGA': '*', 'TGG': 'W',
-    'CTT': 'L', 'CTC': 'L', 'CTA': 'L', 'CTG': 'L',
-    'CCT': 'P', 'CCC': 'P', 'CCA': 'P', 'CCG': 'P',
-    'CAT': 'H', 'CAC': 'H', 'CAA': 'Q', 'CAG': 'Q',
-    'CGT': 'R', 'CGC': 'R', 'CGA': 'R', 'CGG': 'R',
-    'ATT': 'I', 'ATC': 'I', 'ATA': 'I', 'ATG': 'M',
-    'ACT': 'T', 'ACC': 'T', 'ACA': 'T', 'ACG': 'T',
-    'AAT': 'N', 'AAC': 'N', 'AAA': 'K', 'AAG': 'K',
-    'AGT': 'S', 'AGC': 'S', 'AGA': 'R', 'AGG': 'R',
-    'GTT': 'V', 'GTC': 'V', 'GTA': 'V', 'GTG': 'V',
-    'GCT': 'A', 'GCC': 'A', 'GCA': 'A', 'GCG': 'A',
-    'GAT': 'D', 'GAC': 'D', 'GAA': 'E', 'GAG': 'E',
-    'GGT': 'G', 'GGC': 'G', 'GGA': 'G', 'GGG': 'G',
-}
+DATA_DIR = Path(__file__).parent / "data"
 
 @dataclass
-class DNAWorksConfig:
+class CodonEntry:
+    codon: str
+    amino_acid: str
+    frequency: float
+
+@dataclass
+class CodonTable:
+    organism: str
+    entries: List[CodonEntry] = field(default_factory=list)
+
+    _codon_to_aa: Dict[str, str] = field(default_factory=dict, repr=False, init=False)
+    _aa_to_codons: Dict[str, List[CodonEntry]] = field(default_factory=dict, repr=False, init=False)
+
+    def __post_init__(self):
+        self._build_indices()
+
+    def _build_indices(self):
+        self._codon_to_aa = {}
+        self._aa_to_codons = {}
+        for entry in self.entries:
+            self._codon_to_aa[entry.codon] = entry.amino_acid
+            self._aa_to_codons.setdefault(entry.amino_acid, []).append(entry)
+
+    def codon_to_aa(self, codon: str) -> str:
+        return self._codon_to_aa.get(codon, 'X')
+
+    def aa_to_codons(self, amino_acid: str) -> List[str]:
+        return [e.codon for e in self._aa_to_codons.get(amino_acid, [])]
+
+    def aa_to_codon_entries(self, amino_acid: str) -> List[CodonEntry]:
+        return self._aa_to_codons.get(amino_acid, [])
+
+    def get_frequency(self, codon: str) -> float:
+        for entry in self.entries:
+            if entry.codon == codon:
+                return entry.frequency
+        return 0.0
+
+    def codon_to_aa_dict(self) -> Dict[str, str]:
+        return dict(self._codon_to_aa)
+
+    def aa_to_codons_dict(self) -> Dict[str, List[str]]:
+        return {aa: [e.codon for e in entries] for aa, entries in self._aa_to_codons.items()}
+
+    @staticmethod
+    def load(organism: str, data_dir: Optional[Path] = None) -> "CodonTable":
+        if data_dir is None:
+            data_dir = DATA_DIR
+        tsv_path = data_dir / f"{organism}.tsv"
+        if not tsv_path.exists():
+            raise FileNotFoundError(f"Codon table not found: {tsv_path}")
+
+        entries = []
+        with open(tsv_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if parts[0] == "amino_acid":
+                    continue
+                amino_acid, codon, freq = parts[0], parts[1], float(parts[2])
+                entries.append(CodonEntry(codon=codon, amino_acid=amino_acid, frequency=freq))
+
+        return CodonTable(organism=organism, entries=entries)
+
+@dataclass
+class Dnawork:
     seqtype: Seqtype
     melting_low: MeltingTemp
     melting_high: MeltingTemp
@@ -143,37 +195,38 @@ codon {self.organism}
         return sequence
 
     @staticmethod
-    def translate_dna_to_protein(dna_sequence: str) -> str:
+    def translate_dna_to_protein(dna_sequence: str, codon_table: Optional[CodonTable] = None) -> str:
+        if codon_table is None:
+            codon_table = CodonTable.load("ecoli2")
+
         dna_sequence = dna_sequence.upper().replace(' ', '').replace('\n', '').replace('\t', '')
         
-       #print(f"Translating DNA sequence to protein sequence: {dna_sequence}")
         print(f"Length of DNA sequence: {len(dna_sequence)}")
 
         protein_sequence = ""
         for i in range(0, len(dna_sequence) - len(dna_sequence) % 3, 3):
             codon = dna_sequence[i:i+3]
-            if codon in CODON_TABLE:
-                amino_acid = CODON_TABLE[codon]
-                if amino_acid != '*':
-                    protein_sequence += amino_acid
-                else:
-                    break
-            else:
+            amino_acid = codon_table.codon_to_aa(codon)
+            if amino_acid == 'X':
                 protein_sequence += 'X'
+            elif amino_acid != '*':
+                protein_sequence += amino_acid
+            else:
+                break
         
         return protein_sequence
 
     @staticmethod
     def find_consecutive_bases(dna_sequence: str, min_length: int = 6) -> List[tuple]:
         """
-        同じ塩基がmin_length以上連続している箇所を検出する
+        Detect regions where the same base is repeated min_length or more times.
         
         Args:
-            dna_sequence: DNA配列
-            min_length: 検出する最小連続長（デフォルト: 6）
+            dna_sequence: DNA sequence
+            min_length: Minimum consecutive length to detect (default: 6)
         
         Returns:
-            連続箇所のリスト。各要素は(start_index, end_index, base)のタプル
+            List of consecutive regions. Each element is a (start_index, end_index, base) tuple.
         """
         consecutive_regions = []
         i = 0
@@ -188,33 +241,32 @@ codon {self.organism}
         return consecutive_regions
 
     @staticmethod
-    def get_alternative_codons(amino_acid: str) -> List[str]:
+    def get_alternative_codons(amino_acid: str, codon_table: Optional[CodonTable] = None) -> List[str]:
         """
-        指定されたアミノ酸をコードする全てのコドンのリストを返す
+        Return a list of all codons encoding the specified amino acid.
         
         Args:
-            amino_acid: アミノ酸（1文字）
+            amino_acid: Amino acid (single letter)
+            codon_table: CodonTable instance (default: ecoli2)
         
         Returns:
-            コドンのリスト
+            List of codons
         """
-        alternative_codons = []
-        for codon, aa in CODON_TABLE.items():
-            if aa == amino_acid:
-                alternative_codons.append(codon)
-        return alternative_codons
+        if codon_table is None:
+            codon_table = CodonTable.load("ecoli2")
+        return codon_table.aa_to_codons(amino_acid)
 
     @staticmethod
     def find_restriction_sites(dna_sequence: str, excluded_enzymes: List[str]) -> List[Tuple[int, int, str]]:
         """
-        DNA配列中の制限酵素認識配列の全出現位置を返す
+        Return all occurrences of restriction enzyme recognition sites in the DNA sequence.
         
         Args:
-            dna_sequence: DNA配列
-            excluded_enzymes: チェック対象の制限酵素名リスト
+            dna_sequence: DNA sequence
+            excluded_enzymes: List of restriction enzyme names to check
         
         Returns:
-            (start, end, enzyme_name) のリスト
+            List of (start, end, enzyme_name) tuples
         """
         sites = []
         for enzyme in excluded_enzymes:
@@ -235,22 +287,22 @@ codon {self.organism}
                                 max_consecutive: int,
                                 excluded_enzymes: List[str]) -> Tuple[set, List, List]:
         """
-        連続配列および制限酵素認識配列に関わるコドンインデックスを全て収集する
+        Collect all codon indices involved in consecutive base runs and restriction enzyme recognition sites.
         
         Args:
-            dna_sequence: DNA配列
-            codons: コドンのリスト
-            max_consecutive: 許容する最大連続数
-            excluded_enzymes: チェック対象の制限酵素名リスト
+            dna_sequence: DNA sequence
+            codons: List of codons
+            max_consecutive: Maximum allowed consecutive count
+            excluded_enzymes: List of restriction enzyme names to check
         
         Returns:
-            (problem_codon_indices, consecutive_regions, restriction_sites) のタプル
+            Tuple of (problem_codon_indices, consecutive_regions, restriction_sites)
         """
         num_codons = len(codons)
         problem_indices = set()
         
-        # 1. 連続配列に関わるコドンを収集
-        consecutive_regions = DNAWorksConfig.find_consecutive_bases(dna_sequence, max_consecutive + 1)
+        # 1. Collect codons involved in consecutive base runs
+        consecutive_regions = Dnawork.find_consecutive_bases(dna_sequence, max_consecutive + 1)
         for start, end, base in consecutive_regions:
             for i in range(num_codons):
                 codon_start = i * 3
@@ -258,8 +310,8 @@ codon {self.organism}
                 if codon_start < end and codon_end > start:
                     problem_indices.add(i)
         
-        # 2. 制限酵素認識配列に関わるコドンを収集
-        restriction_sites = DNAWorksConfig.find_restriction_sites(dna_sequence, excluded_enzymes)
+        # 2. Collect codons involved in restriction enzyme recognition sites
+        restriction_sites = Dnawork.find_restriction_sites(dna_sequence, excluded_enzymes)
         for start, end, enzyme in restriction_sites:
             for i in range(num_codons):
                 codon_start = i * 3
@@ -270,30 +322,30 @@ codon {self.organism}
         return problem_indices, consecutive_regions, restriction_sites
 
     @staticmethod
-    def expand_and_fragment(problem_indices: set, num_codons: int) -> List[List[int]]:
+    def expand_and_fragment(problem_indices: set, num_codons: int,offset: int = 1) -> List[List[int]]:
         """
-        問題コドンに前後±1を追加し、連続するインデックスをフラグメントにグループ化する
+        Expand problem codons by adding ±offset neighbors, then group consecutive indices into fragments.
         
         Args:
-            problem_indices: 問題のあるコドンインデックスのset
-            num_codons: 全コドン数
+            problem_indices: Set of problematic codon indices
+            num_codons: Total number of codons
         
         Returns:
-            フラグメントのリスト。各フラグメントはソート済みのコドンインデックスリスト
+            List of fragments. Each fragment is a sorted list of codon indices.
         """
-        # 前後±1を追加
+        # Add ±offset neighbors
         expanded = set()
         for idx in problem_indices:
             expanded.add(idx)
-            if idx > 0:
-                expanded.add(idx - 1)
-            if idx < num_codons - 1:
-                expanded.add(idx + 1)
+            if idx > offset:
+                expanded.add(idx - offset)
+            if idx < num_codons - offset:
+                expanded.add(idx + offset)
         
         if not expanded:
             return []
         
-        # ソートして連続するインデックスをグループ化
+        # Sort and group consecutive indices
         sorted_indices = sorted(expanded)
         fragments = []
         current_fragment = [sorted_indices[0]]
@@ -309,85 +361,112 @@ codon {self.organism}
         return fragments
 
     @staticmethod
-    def avoid_consecutive_bases(dna_sequence: str, max_consecutive: int = 5,
-                                excluded_enzymes: Optional[List[str]] = None) -> str:
+    def encode_dna_to_codons(dna_sequence: str) -> List[str]:
+        return [dna_sequence[i:i+3] for i in range(0, len(dna_sequence) - len(dna_sequence) % 3, 3)]
+
+    @staticmethod
+    def codon_damage(old_codon: str, new_codon: str, codon_table: "CodonTable",
+                     epsilon: float = 1e-6) -> float:
         """
-        連続配列(max_consecutive+1以上)および制限酵素認識配列を同時に除去する。
-        
-        アルゴリズム:
-          1. 全体をスキャンし、連続配列・制限酵素認識配列に関わるコドンを収集
-          2. 前後±1コドンを追加し、連続するインデックスをフラグメントに分割
-          3. 各フラグメントについて全コドン組み合わせを網羅的に探索
-          4. フラグメント内部±1コドンの範囲で連続配列・認識配列がないことを確認
-        
+        Compute per-codon replacement damage based on frequency ratio.
+        d_i = max(ln(f_old / f_new), 0)  (only penalize worsening)
+
+        Returns 0.0 if the codon is unchanged.
+        """
+        if old_codon == new_codon:
+            return 0.0
+        f_old = max(codon_table.get_frequency(old_codon), epsilon)
+        f_new = max(codon_table.get_frequency(new_codon), epsilon)
+        return max(math.log(f_old / f_new), 0.0)
+
+    @staticmethod
+    def modify_unfavorble_codons(dna_sequence: str, max_consecutive: int = 5,
+                                excluded_enzymes: Optional[List[str]] = None,
+                                offset: int = 1,
+                                codon_table: Optional[CodonTable] = None,
+                                max_damage: float = 2.0) -> str:
+        """
+        Remove consecutive base runs (>max_consecutive) and restriction enzyme recognition
+        sites simultaneously, selecting replacements that minimize translation damage.
+
+        Candidate scoring (lexicographic order):
+          (k, D_max, D_sum) where
+            k     = number of changed codons
+            D_max = max per-codon damage  d_i+ = max(ln(f_old/f_new), 0)
+            D_sum = sum of per-codon damages
+
+        Candidates with D_max > max_damage are filtered out.  If all candidates
+        exceed the threshold, the best unfiltered candidate is adopted with a warning
+        (fallback C).
+
         Args:
-            dna_sequence: DNA配列（3の倍数である必要がある）
-            max_consecutive: 許容する最大連続数（デフォルト: 5、つまり6以上を避ける）
-            excluded_enzymes: 避けるべき制限酵素名のリスト（デフォルト: None → re_dict全体）
-        
+            dna_sequence: DNA sequence (length must be a multiple of 3)
+            max_consecutive: Maximum allowed consecutive count (default: 5, i.e. avoid 6+)
+            excluded_enzymes: List of restriction enzyme names to avoid (default: all)
+            offset: Flanking codon expansion width (default: 1)
+            codon_table: CodonTable instance (default: ecoli2)
+            max_damage: D_max threshold for filtering candidates (default: 2.0)
+
         Returns:
-            修正されたDNA配列
+            Corrected DNA sequence
         """
         if excluded_enzymes is None:
             excluded_enzymes = list(re_dict.keys())
-        
+        if codon_table is None:
+            codon_table = CodonTable.load("ecoli2")
+
         dna_sequence = dna_sequence.upper().replace(' ', '').replace('\n', '').replace('\t', '')
-        
-        # DNA配列をコドンに分割
+
         codons = [dna_sequence[i:i+3] for i in range(0, len(dna_sequence) - len(dna_sequence) % 3, 3)]
         num_codons = len(codons)
-        
-        # 各コドンをアミノ酸に翻訳
-        amino_acids = [CODON_TABLE.get(c, 'X') for c in codons]
-        
-        # 各アミノ酸に対応する全コドンリストを事前計算
-        aa_to_codons = {}
-        for codon, aa in CODON_TABLE.items():
-            aa_to_codons.setdefault(aa, []).append(codon)
-        
-        # ステップ1: 問題コドンを収集
+        amino_acids = [codon_table.codon_to_aa(c) for c in codons]
+        aa_to_codons = codon_table.aa_to_codons_dict()
+
+        # Step 1: Collect problem codons
         problem_indices, consecutive_regions, restriction_sites = \
-            DNAWorksConfig.collect_problem_codons(dna_sequence, codons, max_consecutive, excluded_enzymes)
-        
+            Dnawork.collect_problem_codons(dna_sequence, codons, max_consecutive, excluded_enzymes)
+
         print(f"\n{'='*60}")
-        print(f"[配列最適化開始] DNA配列長: {len(dna_sequence)}塩基 ({num_codons}コドン)")
-        print(f"  除外対象の制限酵素: {excluded_enzymes}")
-        print(f"  最大許容連続数: {max_consecutive}")
-        print(f"\n  検出された問題:")
+        print(f"[Sequence optimization started] DNA length: {len(dna_sequence)} bp ({num_codons} codons)")
+        print(f"  Organism: {codon_table.organism}")
+        print(f"  Excluded restriction enzymes: {excluded_enzymes}")
+        print(f"  Max allowed consecutive: {max_consecutive}")
+        print(f"  Max damage threshold (D_max): {max_damage}")
+        print(f"\n  Detected problems:")
         if consecutive_regions:
-            print(f"    連続配列: {len(consecutive_regions)}箇所")
+            print(f"    Consecutive runs: {len(consecutive_regions)} site(s)")
             for s, e, b in consecutive_regions:
-                print(f"      位置 {s}-{e}: {b} x {e-s}")
+                print(f"      pos {s}-{e}: {b} x {e-s}")
         else:
-            print(f"    連続配列: なし")
+            print(f"    Consecutive runs: none")
         if restriction_sites:
-            print(f"    制限酵素認識配列: {len(restriction_sites)}箇所")
+            print(f"    Restriction sites: {len(restriction_sites)} site(s)")
             for s, e, enz in restriction_sites:
-                print(f"      位置 {s}-{e}: {enz} ({re_dict[enz]})")
+                print(f"      pos {s}-{e}: {enz} ({re_dict[enz]})")
         else:
-            print(f"    制限酵素認識配列: なし")
-        
+            print(f"    Restriction sites: none")
+
         if not problem_indices:
-            print(f"\n  問題箇所なし。修正不要です。")
+            print(f"\n  No problems found. No correction needed.")
             print(f"{'='*60}")
             return dna_sequence
-        
-        print(f"\n  問題に関わるコドン数: {len(problem_indices)}")
-        
-        # ステップ2: 前後±1を追加してフラグメント化
-        fragments = DNAWorksConfig.expand_and_fragment(problem_indices, num_codons)
-        
-        print(f"  フラグメント数: {len(fragments)}")
+
+        print(f"\n  Number of problem codons: {len(problem_indices)}")
+
+        # Step 2: Expand ±offset and fragment
+        fragments = Dnawork.expand_and_fragment(problem_indices, num_codons, offset)
+
+        print(f"  Number of fragments: {len(fragments)}")
         for i, frag in enumerate(fragments):
-            print(f"    フラグメント{i+1}: コドン位置 {frag[0]}-{frag[-1]} ({len(frag)}コドン)")
+            print(f"    Fragment {i+1}: codon pos {frag[0]}-{frag[-1]} ({len(frag)} codons)")
         print(f"{'='*60}")
-        
-        # ステップ3: フラグメント単位で網羅的探索
+
+        # Step 3: Exhaustive search per fragment with damage scoring
         total_replacements = 0
         failed_fragments = []
-        
+        fallback_fragments = []
+
         for frag_idx, fragment in enumerate(fragments):
-            # フラグメント内の各コドンの代替コドン候補を列挙
             codon_options = []
             for idx in fragment:
                 aa = amino_acids[idx]
@@ -395,109 +474,135 @@ codon {self.organism}
                     codon_options.append(aa_to_codons[aa])
                 else:
                     codon_options.append([codons[idx]])
-            
+
             total_combinations = 1
             for opts in codon_options:
                 total_combinations *= len(opts)
-            
-            print(f"\n[フラグメント{frag_idx+1}] コドン位置 {fragment[0]}-{fragment[-1]}")
-            print(f"  現在のコドン: {[codons[i] for i in fragment]}")
-            print(f"  アミノ酸:     {[amino_acids[i] for i in fragment]}")
-            print(f"  探索する組み合わせ数: {total_combinations}")
-            
-            # チェック範囲: フラグメントの前後1コドンを含むDNA部分文字列
-            check_start_codon = max(0, fragment[0] - 1)
-            check_end_codon = min(num_codons - 1, fragment[-1] + 1)
-            check_start_bp = check_start_codon * 3
-            check_end_bp = (check_end_codon + 1) * 3
-            
-            # 全組み合わせを網羅的に探索
-            best_combo = None
-            best_num_mutations = float('inf')
-            
+
+            print(f"\n[Fragment {frag_idx+1}] codon pos {fragment[0]}-{fragment[-1]}")
+            print(f"  Current codons: {[codons[i] for i in fragment]}")
+            print(f"  Amino acids:    {[amino_acids[i] for i in fragment]}")
+            print(f"  Combinations to search: {total_combinations}")
+
+            check_start_codon = max(0, fragment[0] - 2)
+            check_end_codon = min(num_codons - 1, fragment[-1] + 2)
+
+            # Enumerate all valid candidates with (k, D_max, D_sum, combo)
+            candidates = []
+
             for combo in product(*codon_options):
-                # フラグメント内のコドンを一時的に置き換え
                 temp_codons = codons.copy()
                 for i, idx in enumerate(fragment):
                     temp_codons[idx] = combo[i]
-                
-                # チェック範囲の部分配列を取得
+
                 check_subsequence = ''.join(temp_codons[check_start_codon:check_end_codon + 1])
-                
-                # 連続配列チェック（チェック範囲内）
-                if DNAWorksConfig.find_consecutive_bases(check_subsequence, max_consecutive + 1):
+
+                if Dnawork.find_consecutive_bases(check_subsequence, max_consecutive + 1):
                     continue
-                
-                # 制限酵素認識配列チェック（チェック範囲内）
-                if DNAWorksConfig.find_restriction_sites(check_subsequence, excluded_enzymes):
+                if Dnawork.find_restriction_sites(check_subsequence, excluded_enzymes):
                     continue
-                
-                # 変異数を計算
-                num_mutations = sum(1 for i, idx in enumerate(fragment)
-                                    if combo[i] != codons[idx])
-                
-                if num_mutations < best_num_mutations:
-                    best_num_mutations = num_mutations
-                    best_combo = combo
-                    # 変異数0は元のまま（問題あるはずだが念のため）
-                    # 変異数1で十分なら即採用
-                    if best_num_mutations <= 1:
-                        break
-            
-            if best_combo is not None:
-                # 最適な組み合わせを適用
-                changes = []
+
+                damages = []
+                k = 0
                 for i, idx in enumerate(fragment):
-                    if best_combo[i] != codons[idx]:
-                        changes.append((idx, codons[idx], best_combo[i], amino_acids[idx]))
-                        codons[idx] = best_combo[i]
-                
-                total_replacements += len(changes)
-                if changes:
-                    print(f"  [修正成功] 変異数: {len(changes)}")
-                    for idx, old, new, aa in changes:
-                        print(f"    コドン位置 {idx}: {old} -> {new} (アミノ酸: {aa})")
-                else:
-                    print(f"  [修正不要] 元のコドンで問題なし")
-            else:
+                    if combo[i] != codons[idx]:
+                        k += 1
+                        d = Dnawork.codon_damage(codons[idx], combo[i], codon_table)
+                        damages.append(d)
+
+                d_max = max(damages) if damages else 0.0
+                d_sum = sum(damages) if damages else 0.0
+                candidates.append((k, d_max, d_sum, combo))
+
+            if not candidates:
                 failed_fragments.append((frag_idx + 1, fragment))
-                print(f"  [警告] 全{total_combinations}通りを探索しましたが解決できませんでした")
-        
-        # 最終レポート
+                print(f"  [FAILED] Searched all {total_combinations} combinations but could not resolve")
+                continue
+
+            # Filter by D_max threshold
+            filtered = [c for c in candidates if c[1] <= max_damage]
+
+            if filtered:
+                best = min(filtered, key=lambda x: (x[0], x[1], x[2]))
+                used_fallback = False
+            else : 
+                filtered = [c for c in candidates if c[1] <= max_damage+offset]
+                if filtered:
+                    best = min(filtered, key=lambda x: (x[0], x[1], x[2]))
+                    used_fallback = True
+                    fallback_fragments.append((frag_idx + 1, fragment, best))
+                else:
+                    best = min(candidates, key=lambda x: (x[0], x[1], x[2]))
+                    used_fallback = True
+                    fallback_fragments.append((frag_idx + 1, fragment, best))
+
+            best_k, best_dmax, best_dsum, best_combo = best
+
+            # Apply the best combination
+            changes = []
+            for i, idx in enumerate(fragment):
+                if best_combo[i] != codons[idx]:
+                    d = Dnawork.codon_damage(codons[idx], best_combo[i], codon_table)
+                    changes.append((idx, codons[idx], best_combo[i], amino_acids[idx], d))
+                    codons[idx] = best_combo[i]
+
+            total_replacements += len(changes)
+            if changes:
+                status = "[Fix successful]" if not used_fallback else "[Fix applied - EXCEEDS D_max threshold]"
+                print(f"  {status}")
+                print(f"    Candidates: {len(candidates)} valid, {len(filtered)} passed D_max filter")
+                print(f"    Score: k={best_k}, D_max={best_dmax:.4f}, D_sum={best_dsum:.4f}")
+                for idx, old, new, aa, d in changes:
+                    f_old = codon_table.get_frequency(old)
+                    f_new = codon_table.get_frequency(new)
+                    print(f"    Codon {idx}: {old}(f={f_old:.3f}) -> {new}(f={f_new:.3f})  AA={aa}  d={d:.4f}")
+            else:
+                print(f"  [No fix needed] Original codons are fine")
+
+        # Final report
         final_sequence = ''.join(codons)
-        final_consecutive = DNAWorksConfig.find_consecutive_bases(final_sequence, max_consecutive + 1)
-        final_restriction = DNAWorksConfig.find_restriction_sites(final_sequence, excluded_enzymes)
-        
+        final_consecutive = Dnawork.find_consecutive_bases(final_sequence, max_consecutive + 1)
+        final_restriction = Dnawork.find_restriction_sites(final_sequence, excluded_enzymes)
+
         print(f"\n{'='*60}")
-        print(f"[配列最適化完了]")
-        print(f"  総置き換えコドン数: {total_replacements}")
-        
+        print(f"[Sequence optimization completed]")
+        print(f"  Total replaced codons: {total_replacements}")
+
         if final_consecutive:
-            print(f"  残存連続配列: {len(final_consecutive)}箇所")
+            print(f"  Remaining consecutive runs: {len(final_consecutive)} site(s)")
             for s, e, b in final_consecutive:
-                print(f"    位置 {s}-{e}: {b} x {e-s}")
+                print(f"    pos {s}-{e}: {b} x {e-s}")
         else:
-            print(f"  残存連続配列: なし (OK)")
-        
+            print(f"  Remaining consecutive runs: none (OK)")
+
         if final_restriction:
-            print(f"  残存制限酵素認識配列: {len(final_restriction)}箇所")
+            print(f"  Remaining restriction sites: {len(final_restriction)} site(s)")
             for s, e, enz in final_restriction:
-                print(f"    位置 {s}-{e}: {enz} ({re_dict[enz]})")
+                print(f"    pos {s}-{e}: {enz} ({re_dict[enz]})")
         else:
-            print(f"  残存制限酵素認識配列: なし (OK)")
-        
+            print(f"  Remaining restriction sites: none (OK)")
+
+        if fallback_fragments:
+            print(f"\n  [Warning] {len(fallback_fragments)} fragment(s) exceeded D_max threshold (fallback applied):")
+            for frag_num, frag, (bk, bd, bs, _) in fallback_fragments:
+                print(f"    Fragment {frag_num}: codon {frag[0]}-{frag[-1]}  k={bk} D_max={bd:.4f} D_sum={bs:.4f}")
+
         if failed_fragments:
-            print(f"\n  [警告] 解決できなかったフラグメント: {len(failed_fragments)}個")
+            print(f"\n  [Error] {len(failed_fragments)} fragment(s) could not be resolved:")
             for frag_num, frag in failed_fragments:
-                print(f"    フラグメント{frag_num}: コドン位置 {frag[0]}-{frag[-1]}")
-        
+                print(f"    Fragment {frag_num}: codon pos {frag[0]}-{frag[-1]}")
+
         print(f"{'='*60}")
-        
+
         return final_sequence
 
 
-    def assert_sequence(self,dna_sequence: str) -> None:
-        translated_sequence = self.translate_dna_to_protein(dna_sequence)
+    def get_codon_table(self) -> CodonTable:
+        return CodonTable.load(self.organism)
+
+    def assert_sequence(self, dna_sequence: str) -> None:
+        ct = self.get_codon_table()
+        translated_sequence = self.translate_dna_to_protein(dna_sequence, codon_table=ct)
         assert len(translated_sequence) == len(dna_sequence)/3, "Sequence length mismatch"
         mismatch_count = 0
         for i in range(len(translated_sequence)):
@@ -512,10 +617,10 @@ codon {self.organism}
     @staticmethod
     def calculate_sequence_entropy(sequence: str) -> float:
         sequence = sequence.upper().replace(' ', '').replace('\n', '').replace('\t', '')
-        counts = Counter(sequence)    # 各文字の出現頻度をカウント
-        probabilities = np.array(list(counts.values())) / sum(counts.values())  # 確率分布
-        return entropy(probabilities, base=2)  # エントロピーを計算（単位: bit）
-  
+        counts = Counter(sequence)
+        probabilities = np.array(list(counts.values())) / sum(counts.values())
+        return entropy(probabilities, base=2)
+
 
 def generate_input_file(fasta_path: Path, input_path: Path, logfile_path: Path) -> None:
     with open(fasta_path, "r") as f:
@@ -523,7 +628,7 @@ def generate_input_file(fasta_path: Path, input_path: Path, logfile_path: Path) 
 
     sequence = sequence.replace("X", "TYG")
     sequence = "G"+sequence
-    config = DNAWorksConfig(
+    config = Dnawork(
         jobname=fasta_path.stem,
         seqtype="protein",
         melting_low=68,
@@ -568,38 +673,3 @@ def parse_logfile(logfile: Path) -> None:
                 sequence += match.group(2).strip()
     print(sequence)
     return sequence
-
-
-
-def main():
-    Path("in").mkdir(parents=True, exist_ok=True)
-    Path("fna_tmp").mkdir(parents=True, exist_ok=True)
-    Path("log").mkdir(parents=True, exist_ok=True)
-
-    for fasta_path in Path.cwd().glob("fa/*.fa"):
-        identifier = fasta_path.stem
-        
-        input_path = Path("in")/(identifier+".inp")
-        logfile_path = Path("log")/(identifier+".txt")
-        fna_path = Path("fna_tmp")/(identifier+".fna")
-
-        config = generate_input_file(fasta_path,input_path,logfile_path)
-        # entropy = DNAWorksConfig.calculate_sequence_entropy(config.sequence)
-        # print(f"{identifier}: {entropy}")
-        DNAWorksConfig.run_dnaworks(input_path)
-        dna_sequence = DNAWorksConfig.parse_logfile(logfile_path)
-        config.assert_sequence(dna_sequence)
-
-        with open(fna_path, "w") as f:
-            f.write(">"+identifier+"\n"+dna_sequence)
-
-    # Path("fna_modified").mkdir(parents=True, exist_ok=True)
-    # for fasta_path in Path.cwd().glob("fna/*.fna"):
-    #     nucleotide_sequence = open(fasta_path, "r").readlines()[1].strip()
-    #     amino_acid_sequence = DNAWorksConfig.translate_dna_to_protein(nucleotide_sequence)
-    #     nucleotide_sequence = DNAWorksConfig.avoid_consecutive_bases(nucleotide_sequence)
-    #     assert DNAWorksConfig.translate_dna_to_protein(nucleotide_sequence) == amino_acid_sequence, "Translation mismatch"
-    #     with open(f"./fna_modified/{fasta_path.stem}.fna", "w") as f:
-    #         f.write(">"+fasta_path.stem+"\n"+nucleotide_sequence)
-if __name__ == "__main__":
-    main()
